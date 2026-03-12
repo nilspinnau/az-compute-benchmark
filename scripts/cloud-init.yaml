@@ -68,7 +68,7 @@ runcmd:
       cd "$BENCH_DIR"
       bash "$SCRIPTS_DIR/run-benchmarks.sh" --suites "$BENCHMARK_SUITES" || true
       echo "=== Uploading results ==="
-      bash "$SCRIPTS_DIR/upload-results.sh" || true
+      bash "$SCRIPTS_DIR/upload-results.sh" "$BENCH_DIR/results" || true
       echo "=== Writing DONE marker ==="
       TOKEN=$(curl -s -H "Metadata:true" \
         "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/" \
