@@ -1,0 +1,27 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+*.tfplan
+terraform.tfvars
+.terraform.tfstate.lock.info
+
+# Per-VM state files
+states/
+
+# Benchmark results
+results/
+
+# Logs
+benchmark-run.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+*.swp
+*.swo
+*~
