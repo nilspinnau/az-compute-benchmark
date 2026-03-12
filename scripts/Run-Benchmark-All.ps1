@@ -306,20 +306,32 @@ for ($batchIdx = 0; $batchIdx -lt $totalBatches; $batchIdx++) {
 
     # Deploy all VMs in batch
     Write-Step "Deploying batch $batchNum VMs..."
+    $deployedKeys = @()
     foreach ($key in $batchKeys) {
         Write-SubStep "--- Deploying: $key ($($allVms[$key].vm_size)) ---"
-        Deploy-VM -VmKey $key -VmSize $allVms[$key].vm_size -InfraOutputs $infraOutputs
+        try {
+            Deploy-VM -VmKey $key -VmSize $allVms[$key].vm_size -InfraOutputs $infraOutputs
+            $deployedKeys += $key
+        }
+        catch {
+            Write-Host "WARNING: Failed to deploy $key - $($_.Exception.Message)" -ForegroundColor Yellow
+        }
     }
 
-    # Wait for all VMs in batch to complete benchmarks (polling DONE marker)
+    if ($deployedKeys.Count -eq 0) {
+        Write-Host "WARNING: No VMs deployed in batch $batchNum, skipping." -ForegroundColor Yellow
+        continue
+    }
+
+    # Wait for all successfully deployed VMs to complete benchmarks (polling DONE marker)
     Wait-BenchmarkCompletion `
-        -VmKeys $batchKeys `
+        -VmKeys $deployedKeys `
         -StorageAccount $infraOutputs.storage_account_name `
         -Container $infraOutputs.storage_container_name
 
     # Download results
     Write-Step "Downloading results for batch $batchNum..."
-    foreach ($key in $batchKeys) {
+    foreach ($key in $deployedKeys) {
         Download-Results `
             -StorageAccount $infraOutputs.storage_account_name `
             -Container $infraOutputs.storage_container_name `
@@ -328,7 +340,7 @@ for ($batchIdx = 0; $batchIdx -lt $totalBatches; $batchIdx++) {
 
     # Destroy batch VMs
     Write-Step "Destroying batch $batchNum VMs..."
-    foreach ($key in $batchKeys) {
+    foreach ($key in $deployedKeys) {
         Destroy-VM -VmKey $key -InfraOutputs $infraOutputs
     }
 
