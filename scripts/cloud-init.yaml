@@ -4,7 +4,6 @@ package_update: true
 package_upgrade: false
 
 packages:
-  - sysbench
   - fio
   - iperf3
   - gcc
@@ -17,6 +16,12 @@ packages:
   - jq
   - perl
   - dmidecode
+  - tar
+  - gzip
+  - autoconf
+  - automake
+  - libtool
+  - pkg-config
 
 write_files:
   - path: /etc/benchmark-config
@@ -31,4 +36,17 @@ write_files:
 runcmd:
   - mkdir -p /home/${admin_username}/benchmark
   - chown ${admin_username}:users /home/${admin_username}/benchmark
+  # Install sysbench from source (not in SLES default repos)
+  - |
+    if ! command -v sysbench &>/dev/null; then
+      cd /tmp
+      curl -sL https://github.com/akopytov/sysbench/archive/refs/tags/1.0.20.tar.gz -o sysbench.tar.gz
+      tar -xzf sysbench.tar.gz
+      cd sysbench-1.0.20
+      ./autogen.sh
+      ./configure --without-mysql
+      make -j$(nproc)
+      make install
+      cd /tmp && rm -rf sysbench-1.0.20 sysbench.tar.gz
+    fi
   - echo "cloud-init benchmark setup complete" > /home/${admin_username}/benchmark/.cloud-init-done

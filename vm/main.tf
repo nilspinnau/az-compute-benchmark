@@ -77,7 +77,7 @@ resource "azurerm_virtual_machine_extension" "benchmark" {
   type_handler_version = "2.1"
 
   settings = jsonencode({
-    commandToExecute = "bash /var/lib/waagent/custom-script/download/0/vm-entrypoint.sh"
+    commandToExecute = "nohup bash /var/lib/waagent/custom-script/download/0/vm-entrypoint.sh > /var/log/benchmark-entrypoint.log 2>&1 &"
     fileUris = [
       "${var.github_repo_url}/raw/${var.github_ref}/scripts/vm-entrypoint.sh"
     ]

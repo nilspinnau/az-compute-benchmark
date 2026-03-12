@@ -208,7 +208,7 @@ function Wait-BenchmarkCompletion {
             $ErrorActionPreference = $prevEAP
 
             if ($exists -eq "true") {
-                Write-SubStep "VM $key: benchmark complete"
+                Write-SubStep "VM ${key}: benchmark complete"
                 $pending.Remove($key) | Out-Null
             }
         }

@@ -12,7 +12,6 @@
 set -euo pipefail
 
 LOG_FILE="/var/log/benchmark-entrypoint.log"
-exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "=============================================="
 echo " VM Entrypoint - $(hostname)"

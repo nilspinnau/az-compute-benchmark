@@ -2,15 +2,15 @@
 
 A general-purpose benchmarking toolkit for Azure Virtual Machines, with defaults tuned for **SAP Application Server** workloads.
 
-Deploys VMs via Terraform in batches (to respect quota limits), runs standardized benchmarks via `az vm run-command` (no public IPs needed), collects results via Azure Blob Storage, and merges everything into a comparable summary.
+Deploys VMs via Terraform in batches (respecting quota limits), runs standardized benchmarks automatically via the Azure CustomScript extension, collects results via Azure Blob Storage, and produces a scored comparison summary. No public IPs or SSH access required.
 
 ## Benchmark Suites
 
 | Suite | Tool | What it measures | SAP relevance |
 |-------|------|-----------------|---------------|
-| **cpu** | sysbench | Single & multi-threaded CPU, thread scaling | SAPS rating correlation, dialog step latency |
-| **memory** | sysbench, STREAM | Memory bandwidth (read/write), NUMA topology | In-memory data processing, buffer pools |
-| **disk** | fio | Random/sequential IOPS, throughput, mixed R/W | `/usr/sap`, spool, swap, temp I/O |
+| **cpu** | sysbench | Single & multi-threaded CPU, thread scaling, context switching | SAPS rating correlation, dialog step latency |
+| **memory** | sysbench, STREAM | Memory bandwidth (read/write), NUMA cross-node | In-memory data processing, buffer pools |
+| **disk** | fio | Random/sequential IOPS, throughput, mixed R/W, latency percentiles | `/usr/sap`, spool, swap, temp I/O |
 | **network** | iperf3 | Loopback throughput, TCP tuning, NIC info | App server ↔ DB communication |
 | **system** | UnixBench | Composite system performance score | Overall system comparison |
 
@@ -30,40 +30,36 @@ Raw dumps from `lscpu`, `/proc/cpuinfo`, `/proc/meminfo`, `dmidecode` are also s
 ### Prerequisites
 
 - [Terraform](https://www.terraform.io/downloads) >= 1.5
-- [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) (`az login`)
-- SSH key pair (for VM provisioning, no SSH access needed)
+- [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) (logged in via `az login`)
+- SSH key pair (for VM provisioning — no SSH access is used at runtime)
 - PowerShell 5.1+ (Windows) or pwsh (Linux/macOS)
 
-### One-Command Run (Recommended)
+### One-Command Run
 
 ```powershell
-# 1. Configure
-cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars — set your subscription_id and ssh_public_key_path
+# 1. Configure shared infrastructure
+cp infra/terraform.tfvars.example infra/terraform.tfvars
+# Edit infra/terraform.tfvars — set your subscription_id
 
-# 2. Initialize
-terraform init
-
-# 3. Run everything — deploys in batches, benchmarks, collects, merges, destroys
+# 2. Run everything
 .\scripts\Run-Benchmark-All.ps1
 ```
 
-The orchestration script will:
-1. Deploy shared infrastructure (RG, VNet, Storage Account)
-2. For each batch of VMs (default: 2 at a time):
-   - Deploy VMs
-   - Wait for cloud-init to install benchmark tools
-   - Upload and run benchmark scripts via `az vm run-command`
-   - Upload results to Azure Blob Storage (via managed identity)
-   - Download results locally
+The orchestration script handles the full lifecycle:
+1. **Deploy shared infrastructure** — resource group, VNet, subnet, NAT gateway, NSG, storage account
+2. **For each batch of VMs** (default: 2 at a time):
+   - Deploy VM via Terraform (NIC, VM, managed identity, role assignment, CustomScript extension)
+   - CustomScript extension downloads benchmark scripts from GitHub and launches them in the background
+   - Poll Azure Blob Storage for a `DONE` marker blob (uploaded by the VM when benchmarks finish)
+   - Download results from blob storage locally
    - Destroy the batch VMs
-3. Merge all results into `results/summary.csv`
-4. Destroy all remaining infrastructure
+3. **Score and compare** — parse results into a scored JSON + CSV summary (relative-to-best scoring, weighted composite)
+4. **Destroy infrastructure** (unless `-SkipDestroy` is set)
 
 ### Options
 
 ```powershell
-# Custom batch size
+# Custom batch size (deploy 1 VM at a time)
 .\scripts\Run-Benchmark-All.ps1 -BatchSize 1
 
 # Only run specific suites
@@ -72,87 +68,132 @@ The orchestration script will:
 # Keep infrastructure after benchmarking (for debugging)
 .\scripts\Run-Benchmark-All.ps1 -SkipDestroy
 
-# Custom VM config file
-.\scripts\Run-Benchmark-All.ps1 -ConfigFile my-vms.json
+# Use a different git branch for benchmark scripts
+.\scripts\Run-Benchmark-All.ps1 -GithubRef "dev"
 ```
 
-### Manual / Partial Run
+### Manual / Step-by-Step
 
 ```powershell
-# Deploy specific VMs manually
-terraform apply -var 'vm_configs={"e64asv5":{"vm_size":"Standard_E64as_v5"}}'
+# 1. Deploy shared infrastructure
+cd infra
+terraform init
+terraform apply
+cd ..
 
-# Run benchmarks on deployed VMs
-.\scripts\Deploy-AndRun.ps1
+# 2. Deploy a single VM (uses a separate state file)
+cd vm
+terraform init
+terraform apply \
+  -state="../states/e64asv5.tfstate" \
+  -var="vm_name=e64asv5" \
+  -var="vm_size=Standard_E64as_v5" \
+  -var="resource_group_name=rg-sap-benchmark" \
+  -var="subnet_id=<subnet-id-from-infra-output>" \
+  -var="storage_account_id=<storage-id>" \
+  -var="storage_account_name=<storage-name>" \
+  -var="storage_container_name=benchmark-results"
 
-# Collect and merge results
+# 3. Wait for the DONE marker in blob storage, then download results
+# 4. Destroy VM
+terraform destroy -state="../states/e64asv5.tfstate"
+cd ..
+
+# 5. Collect and score results
 .\scripts\Collect-Results.ps1
 
-# Cleanup
-terraform destroy
-```
-
-### Custom VM Configuration File
-
-Create a JSON file (e.g., `my-vms.json`):
-
-```json
-{
-  "e64asv5": { "vm_size": "Standard_E64as_v5" },
-  "e64sv5":  { "vm_size": "Standard_E64s_v5" },
-  "e96asv5": { "vm_size": "Standard_E96as_v5" },
-  "m128s":   { "vm_size": "Standard_M128s" }
-}
-```
-
-```powershell
-.\scripts\Run-Benchmark-All.ps1 -ConfigFile my-vms.json -BatchSize 1
+# 6. Destroy shared infrastructure
+cd infra && terraform destroy
 ```
 
 ## Architecture
 
 ```
-No public IPs — all VM communication via az vm run-command + Azure Blob Storage
+No public IPs — VMs use NAT gateway for outbound internet only.
+Scripts are downloaded from GitHub. Results are uploaded via managed identity.
 
-┌──────────────┐     az vm run-command      ┌─────────────────┐
-│  Your Client │ ─────────────────────────►  │  Benchmark VM   │
-│  (PowerShell)│                             │  (no public IP) │
-└──────┬───────┘                             └────────┬────────┘
-       │                                              │
-       │  az storage blob download     Managed Identity│
-       │                                              │
-       │         ┌──────────────────┐                 │
-       └────────►│  Storage Account │ ◄───────────────┘
-                 │  (results blob)  │   upload-results.sh
+┌──────────────────┐                     ┌─────────────────────┐
+│  Client Machine  │   terraform apply   │   Benchmark VM      │
+│  (PowerShell +   │ ─────────────────►  │   (no public IP)    │
+│   Terraform)     │                     │                     │
+└──────┬───────────┘                     │  cloud-init:        │
+       │                                 │   - install tools   │
+       │  Poll DONE marker               │   - build sysbench  │
+       │  (az storage blob)              │                     │
+       │                                 │  CustomScript ext:  │
+       │                                 │   - download scripts│
+       │                                 │     from GitHub     │
+       │                                 │   - run benchmarks  │
+       │                                 │   - upload results  │
+       │                                 │   - write DONE blob │
+       │         ┌──────────────────┐    └────────┬────────────┘
+       │         │  Storage Account │             │
+       └────────►│  (Entra ID auth) │ ◄───────────┘
+                 │                  │   Managed Identity
                  └──────────────────┘
+                         ▲
+                         │
+                 ┌───────┴────────┐
+                 │  NAT Gateway   │
+                 │  (outbound)    │
+                 └────────────────┘
 ```
+
+### Key Design Decisions
+
+- **Split Terraform layout** — `infra/` deploys shared resources once; `vm/` deploys one VM per apply with a separate state file per VM. This allows batch deployment and independent teardown.
+- **No SSH, no public IPs** — VMs have only private IPs behind a NAT gateway. Benchmarks execute autonomously via cloud-init + CustomScript extension.
+- **GitHub-based script delivery** — The CustomScript extension downloads `vm-entrypoint.sh` from this GitHub repo, which then downloads the full repo tarball and extracts benchmark scripts. No storage account needed for scripts.
+- **Blob-based result transfer** — VMs upload results using a system-assigned managed identity with `Storage Blob Data Contributor` role. The storage account uses Entra ID (AAD) authentication only — no shared access keys.
+- **DONE marker polling** — Each VM writes a `{vm-name}/DONE` blob when benchmarks finish. The orchestrator polls for these markers rather than waiting on terraform.
+
+## Scoring System
+
+Results are scored using a **relative-to-best** approach:
+- Each metric is scored 0–100, where 100 = best result across all VMs tested
+- Metrics are grouped into categories with configurable weights:
+  - **CPU** (40%): sysbench events/sec, thread scaling efficiency
+  - **Memory** (30%): sysbench throughput, STREAM bandwidth
+  - **Disk** (20%): fio IOPS, throughput, latency
+  - **System** (10%): UnixBench composite score
+- A weighted composite score provides a single ranking number
+
+Output: `results/summary.json` and `results/summary.csv`
 
 ## Project Structure
 
 ```
 .
-├── main.tf                      # VM, network, storage resources
-├── variables.tf                 # Configurable parameters
-├── outputs.tf                   # VM names, storage info
-├── versions.tf                  # Provider versions
-├── terraform.tfvars.example     # Example variable values
+├── infra/                           # Shared infrastructure (deploy once)
+│   ├── providers.tf
+│   ├── variables.tf
+│   ├── main.tf                      # RG, VNet, subnet, NAT gateway, NSG, storage
+│   ├── outputs.tf
+│   └── terraform.tfvars.example
+├── vm/                              # Per-VM deployment (one state file each)
+│   ├── providers.tf
+│   ├── variables.tf
+│   ├── main.tf                      # NIC, VM, role assignment, CustomScript ext
+│   └── outputs.tf
 ├── scripts/
-│   ├── cloud-init.yaml          # VM bootstrap (installs benchmark tools)
-│   ├── run-benchmarks.sh        # Main benchmark runner
-│   ├── upload-results.sh        # Upload results to blob storage
-│   ├── Run-Benchmark-All.ps1    # Full orchestration (deploy/bench/collect/destroy)
-│   ├── Deploy-AndRun.ps1        # Run benchmarks on already-deployed VMs
-│   ├── Collect-Results.ps1      # Parse results into summary CSV
-│   ├── deploy-and-run.sh        # Bash equivalent (for Linux/macOS clients)
-│   ├── collect-results.sh       # Bash equivalent
-│   ├── run-network-pair.sh      # Cross-VM iperf3 tests
+│   ├── cloud-init.yaml              # VM bootstrap (packages, sysbench from source)
+│   ├── vm-entrypoint.sh             # CustomScript entrypoint (download + run + upload)
+│   ├── run-benchmarks.sh            # Main benchmark runner with hardware metadata
+│   ├── upload-results.sh            # Upload results to blob via managed identity
+│   ├── Run-Benchmark-All.ps1        # Full orchestration (PowerShell)
+│   ├── Collect-Results.ps1          # Parse + score results (PowerShell)
+│   ├── collect-results.sh           # Parse + score results (Bash)
+│   ├── run-network-pair.sh          # Cross-VM iperf3 tests
 │   └── suites/
-│       ├── cpu.sh               # sysbench CPU benchmarks
-│       ├── memory.sh            # sysbench memory + STREAM
-│       ├── disk.sh              # fio I/O benchmarks
-│       ├── network.sh           # iperf3 + NIC diagnostics
-│       └── system.sh            # UnixBench composite score
-└── results/                     # Benchmark output (gitignored)
+│       ├── cpu.sh                   # sysbench CPU benchmarks
+│       ├── memory.sh               # sysbench memory + STREAM
+│       ├── disk.sh                  # fio I/O benchmarks
+│       ├── network.sh              # iperf3 + NIC diagnostics
+│       └── system.sh               # UnixBench composite score
+├── states/                          # Per-VM Terraform state files (gitignored)
+├── results/                         # Benchmark output (gitignored)
+├── .gitattributes                   # LF for .sh/.yaml/.tf, CRLF for .ps1
+└── .gitignore
 ```
 
 ## Adding Custom Benchmark Suites
@@ -169,7 +210,7 @@ mkdir -p "$RESULTS_DIR"
 echo "    [custom] Done. Results in $RESULTS_DIR"
 ```
 
-Then run with: `--Suites "cpu,memory,custom"`
+Then include it: `-Suites "cpu,memory,custom"`
 
 ## Default VM Configurations
 
@@ -178,6 +219,18 @@ Then run with: `--Suites "cpu,memory,custom"`
 | e64asv5 | Standard_E64as_v5 | 64 | 512 GiB | AMD EPYC 7763 |
 | e64sv5 | Standard_E64s_v5 | 64 | 512 GiB | Intel Xeon Platinum 8370C |
 | e96asv5 | Standard_E96as_v5 | 96 | 672 GiB | AMD EPYC 7763 |
+
+To benchmark different VM sizes, edit the `$allVms` hashtable in `scripts/Run-Benchmark-All.ps1`.
+
+## Requirements
+
+| Component | Version |
+|-----------|---------|
+| Terraform | >= 1.5 |
+| AzureRM Provider | ~> 4.0 |
+| Azure CLI | Latest |
+| PowerShell | 5.1+ (Windows) / pwsh (Linux/macOS) |
+| OS Image | SUSE SLES for SAP 15 SP5 (configurable) |
 
 ## License
 
