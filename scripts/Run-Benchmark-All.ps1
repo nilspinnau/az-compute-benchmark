@@ -6,9 +6,9 @@
 .DESCRIPTION
     Uses a split Terraform layout:
       - infra/  : shared resources (RG, VNet, storage) - deployed once
-      - vm/     : single VM (NIC, VM, extension) - one state file per VM
+      - vm/     : single VM (NIC, VM, role assignment) - one state file per VM
 
-    Each VM automatically runs benchmarks via CustomScript extension and uploads
+    Each VM automatically runs benchmarks via cloud-init and uploads
     results + a DONE marker to blob storage. The orchestrator just polls for
     completion, downloads results, and tears down.
 

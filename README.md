@@ -48,8 +48,8 @@ cp infra/terraform.tfvars.example infra/terraform.tfvars
 The orchestration script handles the full lifecycle:
 1. **Deploy shared infrastructure** — resource group, VNet, subnet, NAT gateway, NSG, storage account
 2. **For each batch of VMs** (default: 2 at a time):
-   - Deploy VM via Terraform (NIC, VM, managed identity, role assignment, CustomScript extension)
-   - CustomScript extension downloads benchmark scripts from GitHub and launches them in the background
+   - Deploy VM via Terraform (NIC, VM, managed identity, role assignment)
+   - cloud-init installs tools, builds sysbench, downloads scripts from GitHub, and runs benchmarks autonomously
    - Poll Azure Blob Storage for a `DONE` marker blob (uploaded by the VM when benchmarks finish)
    - Download results from blob storage locally
    - Destroy the batch VMs
@@ -119,9 +119,7 @@ Scripts are downloaded from GitHub. Results are uploaded via managed identity.
 └──────┬───────────┘                     │  cloud-init:        │
        │                                 │   - install tools   │
        │  Poll DONE marker               │   - build sysbench  │
-       │  (az storage blob)              │                     │
-       │                                 │  CustomScript ext:  │
-       │                                 │   - download scripts│
+       │  (az storage blob)              │   - download scripts│
        │                                 │     from GitHub     │
        │                                 │   - run benchmarks  │
        │                                 │   - upload results  │
@@ -142,10 +140,10 @@ Scripts are downloaded from GitHub. Results are uploaded via managed identity.
 ### Key Design Decisions
 
 - **Split Terraform layout** — `infra/` deploys shared resources once; `vm/` deploys one VM per apply with a separate state file per VM. This allows batch deployment and independent teardown.
-- **No SSH, no public IPs** — VMs have only private IPs behind a NAT gateway. Benchmarks execute autonomously via cloud-init + CustomScript extension.
-- **GitHub-based script delivery** — The CustomScript extension downloads `vm-entrypoint.sh` from this GitHub repo, which then downloads the full repo tarball and extracts benchmark scripts. No storage account needed for scripts.
+- **No SSH, no public IPs** — VMs have only private IPs behind a NAT gateway. Benchmarks execute autonomously via cloud-init.
+- **GitHub-based script delivery** — cloud-init downloads the full repo tarball from GitHub and extracts benchmark scripts. No storage account needed for scripts.
 - **Blob-based result transfer** — VMs upload results using a system-assigned managed identity with `Storage Blob Data Contributor` role. The storage account uses Entra ID (AAD) authentication only — no shared access keys.
-- **DONE marker polling** — Each VM writes a `{vm-name}/DONE` blob when benchmarks finish. The orchestrator polls for these markers rather than waiting on terraform.
+- **DONE marker polling** — Each VM writes a `{vm-name}/DONE` blob when benchmarks finish. The orchestrator polls for these markers. Since all benchmark work runs via cloud-init (asynchronous to terraform), terraform apply returns quickly after provisioning the VM.
 
 ## Scoring System
 
@@ -173,11 +171,11 @@ Output: `results/summary.json` and `results/summary.csv`
 ├── vm/                              # Per-VM deployment (one state file each)
 │   ├── providers.tf
 │   ├── variables.tf
-│   ├── main.tf                      # NIC, VM, role assignment, CustomScript ext
+│   ├── main.tf                      # NIC, VM, managed identity, role assignment
 │   └── outputs.tf
 ├── scripts/
-│   ├── cloud-init.yaml              # VM bootstrap (packages, sysbench from source)
-│   ├── vm-entrypoint.sh             # CustomScript entrypoint (download + run + upload)
+│   ├── cloud-init.yaml              # VM bootstrap (packages, sysbench, benchmarks)
+│   ├── vm-entrypoint.sh             # Standalone entrypoint (alternative to cloud-init)
 │   ├── run-benchmarks.sh            # Main benchmark runner with hardware metadata
 │   ├── upload-results.sh            # Upload results to blob via managed identity
 │   ├── Run-Benchmark-All.ps1        # Full orchestration (PowerShell)

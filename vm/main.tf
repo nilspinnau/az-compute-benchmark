@@ -66,24 +66,3 @@ resource "azurerm_role_assignment" "blob_contributor" {
   role_definition_name = "Storage Blob Data Contributor"
   principal_id         = azurerm_linux_virtual_machine.this.identity[0].principal_id
 }
-
-# --- CustomScript Extension: downloads scripts from GitHub and runs benchmarks ---
-
-resource "azurerm_virtual_machine_extension" "benchmark" {
-  name                 = "run-benchmark"
-  virtual_machine_id   = azurerm_linux_virtual_machine.this.id
-  publisher            = "Microsoft.Azure.Extensions"
-  type                 = "CustomScript"
-  type_handler_version = "2.1"
-
-  settings = jsonencode({
-    commandToExecute = "nohup bash /var/lib/waagent/custom-script/download/0/vm-entrypoint.sh > /var/log/benchmark-entrypoint.log 2>&1 &"
-    fileUris = [
-      "${var.github_repo_url}/raw/${var.github_ref}/scripts/vm-entrypoint.sh"
-    ]
-  })
-
-  depends_on = [azurerm_role_assignment.blob_contributor]
-
-  tags = var.tags
-}

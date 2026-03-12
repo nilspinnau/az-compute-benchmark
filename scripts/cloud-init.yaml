@@ -49,4 +49,44 @@ runcmd:
       make install
       cd /tmp && rm -rf sysbench-1.0.20 sysbench.tar.gz
     fi
-  - echo "cloud-init benchmark setup complete" > /home/${admin_username}/benchmark/.cloud-init-done
+  # Download benchmark scripts from GitHub and run everything
+  - |
+    exec > >(tee -a /var/log/benchmark-entrypoint.log) 2>&1
+    source /etc/benchmark-config
+    BENCH_DIR="/home/${admin_username}/benchmark"
+    echo "=== Downloading scripts from GitHub ==="
+    TARBALL_URL="$${GITHUB_REPO_URL}/archive/refs/heads/$${GITHUB_REF}.tar.gz"
+    TEMP_DIR=$(mktemp -d)
+    curl -sL "$$TARBALL_URL" -o "$${TEMP_DIR}/repo.tar.gz"
+    tar -xzf "$${TEMP_DIR}/repo.tar.gz" -C "$$TEMP_DIR"
+    EXTRACTED_DIR=$(find "$$TEMP_DIR" -maxdepth 1 -type d -name '*-*' | head -1)
+    SCRIPTS_DIR="$${BENCH_DIR}/scripts"
+    mkdir -p "$$SCRIPTS_DIR"
+    cp -r "$$EXTRACTED_DIR/scripts/"* "$$SCRIPTS_DIR/"
+    chmod -R +x "$$SCRIPTS_DIR/"
+    rm -rf "$$TEMP_DIR"
+    echo "=== Running benchmarks (suites: $${BENCHMARK_SUITES}) ==="
+    cd "$$BENCH_DIR"
+    bash "$${SCRIPTS_DIR}/run-benchmarks.sh" --suites "$$BENCHMARK_SUITES" || true
+    echo "=== Uploading results ==="
+    bash "$${SCRIPTS_DIR}/upload-results.sh" || true
+    echo "=== Writing DONE marker ==="
+    TOKEN=$(curl -s -H "Metadata:true" \
+      "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/" \
+      | jq -r '.access_token')
+    if [ -n "$$TOKEN" ] && [ "$$TOKEN" != "null" ]; then
+      VM_NAME=$(hostname)
+      BLOB_URL="https://$${STORAGE_ACCOUNT}.blob.core.windows.net/$${CONTAINER_NAME}"
+      MARKER="{\"hostname\":\"$${VM_NAME}\",\"completed\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"benchmark_exit_code\":0}"
+      curl -s -X PUT \
+        -H "Authorization: Bearer $$TOKEN" \
+        -H "x-ms-blob-type: BlockBlob" \
+        -H "x-ms-version: 2020-10-02" \
+        -H "Content-Type: application/json" \
+        --data "$$MARKER" \
+        "$${BLOB_URL}/$${VM_NAME}/DONE"
+      echo "DONE marker uploaded: $${VM_NAME}/DONE"
+    else
+      echo "WARNING: Could not get token for DONE marker"
+    fi
+    echo "=== Benchmark entrypoint complete ==="
