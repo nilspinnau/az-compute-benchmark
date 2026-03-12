@@ -1,19 +1,17 @@
 <#
 .SYNOPSIS
-    Orchestrate VM benchmarks: deploy infra, deploy VMs in batches, poll for
-    completion, collect results, destroy.
+    Orchestrate VM benchmarks: deploy infra, deploy all VMs in parallel,
+    poll for completion, download results & destroy each VM as it finishes.
 
 .DESCRIPTION
     Uses a split Terraform layout:
       - infra/  : shared resources (RG, VNet, storage) - deployed once
       - vm/     : single VM (NIC, VM, role assignment) - one state file per VM
 
-    Each VM automatically runs benchmarks via cloud-init and uploads
-    results + a DONE marker to blob storage. The orchestrator just polls for
-    completion, downloads results, and tears down.
-
-.PARAMETER BatchSize
-    Max VMs to deploy simultaneously. Default: 2
+    All VMs are deployed simultaneously via background processes.
+    A polling loop checks for DONE markers in blob storage. As soon as a
+    VM finishes, its results are downloaded and the VM is destroyed — freeing
+    quota for other workloads.
 
 .PARAMETER Suites
     Comma-separated benchmark suites. Default: cpu,memory,disk,network,system
@@ -24,15 +22,18 @@
 .PARAMETER GithubRef
     Git branch/tag/commit for benchmark scripts. Default: main
 
+.PARAMETER MaxWaitMinutes
+    Maximum minutes to wait for benchmarks. Default: 120
+
 .EXAMPLE
     .\Run-Benchmark-All.ps1
-    .\Run-Benchmark-All.ps1 -BatchSize 1 -Suites "cpu,memory"
+    .\Run-Benchmark-All.ps1 -Suites "cpu,memory"
     .\Run-Benchmark-All.ps1 -SkipDestroy
 #>
 param(
-    [int]$BatchSize = 2,
     [string]$Suites = "cpu,memory,disk,network,system",
     [string]$GithubRef = "main",
+    [int]$MaxWaitMinutes = 120,
     [switch]$SkipDestroy
 )
 
@@ -45,21 +46,16 @@ $ResultsDir = Join-Path $ProjectDir "results"
 $ScriptsDir = $PSScriptRoot
 
 # --- VM configurations ---
+# Add or remove entries here. Each key becomes the VM name suffix and state file name.
 $allVms = [ordered]@{
     "e64asv5" = @{ vm_size = "Standard_E64as_v5" }
     "e64sv5"  = @{ vm_size = "Standard_E64s_v5" }
-    "e96asv5" = @{ vm_size = "Standard_E96as_v5" }
+    "e64asv6" = @{ vm_size = "Standard_E64as_v6" }
 }
 
-$vmNames = @($allVms.Keys)
-$totalVms = $vmNames.Count
-$totalBatches = [math]::Ceiling($totalVms / $BatchSize)
-
 Write-Host "=============================================="  -ForegroundColor Cyan
-Write-Host " Azure VM Benchmark - Split Orchestrator"       -ForegroundColor Cyan
-Write-Host " VMs to benchmark: $totalVms"                   -ForegroundColor Cyan
-Write-Host " Batch size: $BatchSize"                        -ForegroundColor Cyan
-Write-Host " Total batches: $totalBatches"                  -ForegroundColor Cyan
+Write-Host " Azure VM Benchmark"                            -ForegroundColor Cyan
+Write-Host " VMs: $($allVms.Keys -join ', ')"               -ForegroundColor Cyan
 Write-Host " Suites: $Suites"                               -ForegroundColor Cyan
 Write-Host " Git ref: $GithubRef"                           -ForegroundColor Cyan
 Write-Host "=============================================="  -ForegroundColor Cyan
@@ -91,7 +87,6 @@ function Invoke-Terraform {
         $exitCode = $LASTEXITCODE
         $ErrorActionPreference = $prevEAP
 
-        # Always show output
         $output | ForEach-Object { Write-Host "  $_" }
 
         if ($exitCode -ne 0) {
@@ -119,18 +114,13 @@ function Get-InfraOutput {
     }
 }
 
-function Deploy-VM {
+function Get-TerraformVarArgs {
     param(
         [string]$VmKey,
         [string]$VmSize,
         [hashtable]$InfraOutputs
     )
-
-    $stateFile = Join-Path $StatesDir "$VmKey.tfstate"
-
-    $tfArgs = @(
-        "apply", "-auto-approve",
-        "-state", $stateFile,
+    return @(
         "-var", "subscription_id=$($InfraOutputs.subscription_id)",
         "-var", "resource_group_name=$($InfraOutputs.resource_group_name)",
         "-var", "location=$($InfraOutputs.location)",
@@ -144,86 +134,6 @@ function Deploy-VM {
         "-var", "benchmark_suites=$Suites",
         "-var", "github_ref=$GithubRef"
     )
-
-    Invoke-Terraform -WorkDir $VmDir -Arguments $tfArgs -Description "Deploy VM $VmKey"
-}
-
-function Destroy-VM {
-    param(
-        [string]$VmKey,
-        [hashtable]$InfraOutputs
-    )
-
-    $stateFile = Join-Path $StatesDir "$VmKey.tfstate"
-    if (-not (Test-Path $stateFile)) {
-        Write-SubStep "No state file for $VmKey, skipping destroy"
-        return
-    }
-
-    $tfArgs = @(
-        "destroy", "-auto-approve",
-        "-state", $stateFile,
-        "-var", "subscription_id=$($InfraOutputs.subscription_id)",
-        "-var", "resource_group_name=$($InfraOutputs.resource_group_name)",
-        "-var", "location=$($InfraOutputs.location)",
-        "-var", "subnet_id=$($InfraOutputs.subnet_id)",
-        "-var", "storage_account_id=$($InfraOutputs.storage_account_id)",
-        "-var", "storage_account_name=$($InfraOutputs.storage_account_name)",
-        "-var", "storage_container_name=$($InfraOutputs.storage_container_name)",
-        "-var", "vm_name=$VmKey",
-        "-var", "vm_size=Standard_D2s_v5",
-        "-var", "ssh_public_key_path=$($InfraOutputs.ssh_public_key_path)"
-    )
-
-    Invoke-Terraform -WorkDir $VmDir -Arguments $tfArgs -Description "Destroy VM $VmKey"
-}
-
-function Wait-BenchmarkCompletion {
-    param(
-        [string[]]$VmKeys,
-        [string]$StorageAccount,
-        [string]$Container,
-        [int]$MaxWaitMinutes = 120
-    )
-
-    Write-Step "Waiting for benchmarks to complete..."
-    $pending = [System.Collections.Generic.List[string]]::new($VmKeys)
-    $maxAttempts = $MaxWaitMinutes * 2  # check every 30s
-    $attempt = 0
-
-    while ($pending.Count -gt 0 -and $attempt -lt $maxAttempts) {
-        $attempt++
-        Start-Sleep -Seconds 30
-
-        foreach ($key in @($pending)) {
-            $blobName = "vm-bench-${key}/DONE"
-            $prevEAP = $ErrorActionPreference
-            $ErrorActionPreference = "Continue"
-            $exists = az storage blob exists `
-                --account-name $StorageAccount `
-                --container-name $Container `
-                --name $blobName `
-                --auth-mode login `
-                --query "exists" -o tsv 2>$null
-            $ErrorActionPreference = $prevEAP
-
-            if ($exists -eq "true") {
-                Write-SubStep "VM ${key}: benchmark complete"
-                $pending.Remove($key) | Out-Null
-            }
-        }
-
-        if ($pending.Count -gt 0 -and ($attempt % 4 -eq 0)) {
-            $elapsed = $attempt * 30
-            Write-SubStep "Still waiting (${elapsed}s): $($pending -join ', ')"
-        }
-    }
-
-    if ($pending.Count -gt 0) {
-        Write-Host "WARNING: Benchmarks did not complete for: $($pending -join ', ')" -ForegroundColor Yellow
-        return $false
-    }
-    return $true
 }
 
 function Download-Results {
@@ -272,16 +182,15 @@ Write-Step "Deploying shared infrastructure..."
 Invoke-Terraform -WorkDir $InfraDir -Arguments @("init", "-input=false") -Description "infra init"
 Invoke-Terraform -WorkDir $InfraDir -Arguments @("apply", "-auto-approve") -Description "infra apply"
 
-# Read infra outputs
 $infraOutputs = @{
-    subscription_id      = (Get-Content (Join-Path $InfraDir "terraform.tfvars") | Select-String 'subscription_id\s*=' | ForEach-Object { ($_ -split '"')[1] })
-    resource_group_name  = Get-InfraOutput "resource_group_name"
-    location             = Get-InfraOutput "location"
-    subnet_id            = Get-InfraOutput "subnet_id"
-    storage_account_id   = Get-InfraOutput "storage_account_id"
-    storage_account_name = Get-InfraOutput "storage_account_name"
+    subscription_id        = (Get-Content (Join-Path $InfraDir "terraform.tfvars") | Select-String 'subscription_id\s*=' | ForEach-Object { ($_ -split '"')[1] })
+    resource_group_name    = Get-InfraOutput "resource_group_name"
+    location               = Get-InfraOutput "location"
+    subnet_id              = Get-InfraOutput "subnet_id"
+    storage_account_id     = Get-InfraOutput "storage_account_id"
+    storage_account_name   = Get-InfraOutput "storage_account_name"
     storage_container_name = Get-InfraOutput "storage_container_name"
-    ssh_public_key_path  = "~/.ssh/id_aldi_ed25519.pub"
+    ssh_public_key_path    = "~/.ssh/id_aldi_ed25519.pub"
 }
 
 Write-SubStep "Resource group: $($infraOutputs.resource_group_name)"
@@ -291,68 +200,142 @@ Write-SubStep "Storage account: $($infraOutputs.storage_account_name)"
 Write-Step "Initializing VM module..."
 Invoke-Terraform -WorkDir $VmDir -Arguments @("init", "-input=false") -Description "vm init"
 
-# --- 2. Process batches ---
-for ($batchIdx = 0; $batchIdx -lt $totalBatches; $batchIdx++) {
-    $startIdx = $batchIdx * $BatchSize
-    $endIdx = [math]::Min($startIdx + $BatchSize, $totalVms) - 1
-    $batchKeys = $vmNames[$startIdx..$endIdx]
-    $batchNum = $batchIdx + 1
+# --- 2. Deploy all VMs in parallel ---
+Write-Step "Deploying all VMs in parallel..."
+$deployJobs = @{}
 
-    Write-Host ""
-    Write-Host "=============================================="  -ForegroundColor Yellow
-    Write-Host " Batch $batchNum / $totalBatches"               -ForegroundColor Yellow
-    Write-Host " VMs: $($batchKeys -join ', ')"                 -ForegroundColor Yellow
-    Write-Host "=============================================="  -ForegroundColor Yellow
+foreach ($key in $allVms.Keys) {
+    $vmSize = $allVms[$key].vm_size
+    $stateFile = Join-Path $StatesDir "$key.tfstate"
+    $logFile = Join-Path $StatesDir "$key-deploy.log"
+    $varArgs = Get-TerraformVarArgs -VmKey $key -VmSize $vmSize -InfraOutputs $infraOutputs
 
-    # Deploy all VMs in batch
-    Write-Step "Deploying batch $batchNum VMs..."
-    $deployedKeys = @()
-    foreach ($key in $batchKeys) {
-        Write-SubStep "--- Deploying: $key ($($allVms[$key].vm_size)) ---"
-        try {
-            Deploy-VM -VmKey $key -VmSize $allVms[$key].vm_size -InfraOutputs $infraOutputs
-            $deployedKeys += $key
-        }
-        catch {
-            Write-Host "WARNING: Failed to deploy $key - $($_.Exception.Message)" -ForegroundColor Yellow
-        }
-    }
+    Write-SubStep "Starting deploy: $key ($vmSize)"
 
-    if ($deployedKeys.Count -eq 0) {
-        Write-Host "WARNING: No VMs deployed in batch $batchNum, skipping." -ForegroundColor Yellow
-        continue
-    }
+    $job = Start-Job -ScriptBlock {
+        param($vmDir, $stateFile, $varArgs, $logFile)
+        Set-Location $vmDir
+        $allArgs = @("apply", "-auto-approve", "-state", $stateFile, "-input=false") + $varArgs
+        & terraform @allArgs *>&1 | Tee-Object -FilePath $logFile
+        return $LASTEXITCODE
+    } -ArgumentList $VmDir, $stateFile, $varArgs, $logFile
 
-    # Wait for all successfully deployed VMs to complete benchmarks (polling DONE marker)
-    Wait-BenchmarkCompletion `
-        -VmKeys $deployedKeys `
-        -StorageAccount $infraOutputs.storage_account_name `
-        -Container $infraOutputs.storage_container_name
-
-    # Download results
-    Write-Step "Downloading results for batch $batchNum..."
-    foreach ($key in $deployedKeys) {
-        Download-Results `
-            -StorageAccount $infraOutputs.storage_account_name `
-            -Container $infraOutputs.storage_container_name `
-            -VmKey $key
-    }
-
-    # Destroy batch VMs
-    Write-Step "Destroying batch $batchNum VMs..."
-    foreach ($key in $deployedKeys) {
-        Destroy-VM -VmKey $key -InfraOutputs $infraOutputs
-    }
-
-    Write-Host "Batch $batchNum complete." -ForegroundColor Green
+    $deployJobs[$key] = $job
 }
 
-# --- 3. Merge results ---
-Write-Host ""
-Write-Step "Collecting and scoring results..."
-& "$ScriptsDir\Collect-Results.ps1" -ResultsDir $ResultsDir
+# Wait for all deploy jobs to finish
+Write-Step "Waiting for all deployments to complete..."
+$deployedKeys = @()
+foreach ($key in @($deployJobs.Keys)) {
+    $job = $deployJobs[$key]
+    $result = Receive-Job -Job $job -Wait
+    $jobState = $job.State
 
-# --- 4. Final cleanup ---
+    if ($jobState -eq "Completed") {
+        Write-SubStep "$key : deployed successfully"
+        $deployedKeys += $key
+    }
+    else {
+        Write-Host "WARNING: $key deployment failed ($jobState)" -ForegroundColor Yellow
+        $logFile = Join-Path $StatesDir "$key-deploy.log"
+        if (Test-Path $logFile) {
+            Get-Content $logFile -Tail 10 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkYellow }
+        }
+    }
+    Remove-Job -Job $job -Force
+}
+
+if ($deployedKeys.Count -eq 0) {
+    Write-Host "ERROR: No VMs deployed successfully. Aborting." -ForegroundColor Red
+    exit 1
+}
+
+Write-SubStep "Successfully deployed: $($deployedKeys -join ', ')"
+
+# --- 3. Poll for completion — download & destroy each VM as it finishes ---
+Write-Step "Polling for benchmark completion (max $MaxWaitMinutes min)..."
+$pending = [System.Collections.Generic.List[string]]::new($deployedKeys)
+$completed = @()
+$maxAttempts = $MaxWaitMinutes * 2  # every 30s
+$attempt = 0
+
+while ($pending.Count -gt 0 -and $attempt -lt $maxAttempts) {
+    $attempt++
+    Start-Sleep -Seconds 30
+
+    foreach ($key in @($pending)) {
+        $blobName = "vm-bench-${key}/DONE"
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $exists = az storage blob exists `
+            --account-name $infraOutputs.storage_account_name `
+            --container-name $infraOutputs.storage_container_name `
+            --name $blobName `
+            --auth-mode login `
+            --query "exists" -o tsv 2>$null
+        $ErrorActionPreference = $prevEAP
+
+        if ($exists -eq "true") {
+            Write-SubStep "$key : benchmark complete — downloading results & destroying VM"
+            $pending.Remove($key) | Out-Null
+            $completed += $key
+
+            # Download results immediately
+            Download-Results `
+                -StorageAccount $infraOutputs.storage_account_name `
+                -Container $infraOutputs.storage_container_name `
+                -VmKey $key
+
+            # Destroy VM in background so polling continues
+            $stateFile = Join-Path $StatesDir "$key.tfstate"
+            $logFile = Join-Path $StatesDir "$key-destroy.log"
+            $varArgs = Get-TerraformVarArgs -VmKey $key -VmSize $allVms[$key].vm_size -InfraOutputs $infraOutputs
+            Start-Job -Name "destroy-$key" -ScriptBlock {
+                param($vmDir, $stateFile, $varArgs, $logFile)
+                Set-Location $vmDir
+                $allArgs = @("destroy", "-auto-approve", "-state", $stateFile, "-input=false") + $varArgs
+                & terraform @allArgs *>&1 | Tee-Object -FilePath $logFile
+            } -ArgumentList $VmDir, $stateFile, $varArgs, $logFile | Out-Null
+        }
+    }
+
+    if ($pending.Count -gt 0 -and ($attempt % 4 -eq 0)) {
+        $elapsed = [math]::Round($attempt * 30 / 60, 1)
+        Write-SubStep "Waiting (${elapsed}m): $($pending -join ', ')"
+    }
+}
+
+if ($pending.Count -gt 0) {
+    Write-Host "WARNING: Benchmarks did not complete for: $($pending -join ', ')" -ForegroundColor Yellow
+    foreach ($key in $pending) {
+        Write-SubStep "Destroying timed-out VM: $key"
+        $stateFile = Join-Path $StatesDir "$key.tfstate"
+        $varArgs = Get-TerraformVarArgs -VmKey $key -VmSize $allVms[$key].vm_size -InfraOutputs $infraOutputs
+        Start-Job -Name "destroy-$key" -ScriptBlock {
+            param($vmDir, $stateFile, $varArgs)
+            Set-Location $vmDir
+            $allArgs = @("destroy", "-auto-approve", "-state", $stateFile, "-input=false") + $varArgs
+            & terraform @allArgs *>&1
+        } -ArgumentList $VmDir, $stateFile, $varArgs | Out-Null
+    }
+}
+
+# Wait for all background destroy jobs
+Write-Step "Waiting for VM destroy jobs to complete..."
+Get-Job | Where-Object { $_.Name -like "destroy-*" -and $_.State -eq "Running" } | Wait-Job -Timeout 300 | Out-Null
+Get-Job | Where-Object { $_.Name -like "destroy-*" } | Remove-Job -Force
+
+# --- 4. Collect & score results ---
+if ($completed.Count -gt 0) {
+    Write-Host ""
+    Write-Step "Collecting and scoring results..."
+    & "$ScriptsDir\Collect-Results.ps1" -ResultsDir $ResultsDir
+}
+else {
+    Write-Host "No completed benchmarks to score." -ForegroundColor Yellow
+}
+
+# --- 5. Final cleanup ---
 if (-not $SkipDestroy) {
     Write-Host ""
     Write-Step "Destroying shared infrastructure..."
@@ -360,12 +343,13 @@ if (-not $SkipDestroy) {
 }
 else {
     Write-Host ""
-    Write-Host "Skipping final destroy (--SkipDestroy). Run 'terraform -chdir=infra destroy' manually." -ForegroundColor Yellow
+    Write-Host "Skipping final destroy (-SkipDestroy). Run 'terraform -chdir=infra destroy' manually." -ForegroundColor Yellow
 }
 
 Write-Host ""
 Write-Host "=============================================="  -ForegroundColor Green
 Write-Host " Benchmarking complete!"                        -ForegroundColor Green
+Write-Host " Completed: $($completed -join ', ')"           -ForegroundColor Green
 Write-Host " Results: $ResultsDir"                          -ForegroundColor Green
 Write-Host " JSON:    $(Join-Path $ResultsDir 'results.json')" -ForegroundColor Green
 Write-Host " CSV:     $(Join-Path $ResultsDir 'summary.csv')"  -ForegroundColor Green
