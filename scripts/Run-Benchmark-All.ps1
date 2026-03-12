@@ -10,7 +10,7 @@
 
     All VMs are deployed simultaneously via background processes.
     A polling loop checks for DONE markers in blob storage. As soon as a
-    VM finishes, its results are downloaded and the VM is destroyed — freeing
+    VM finishes, its results are downloaded and the VM is destroyed - freeing
     quota for other workloads.
 
 .PARAMETER Suites
@@ -216,7 +216,8 @@ foreach ($key in $allVms.Keys) {
         param($vmDir, $stateFile, $varArgs, $logFile)
         Set-Location $vmDir
         $allArgs = @("apply", "-auto-approve", "-state", $stateFile, "-input=false") + $varArgs
-        & terraform @allArgs *>&1 | Tee-Object -FilePath $logFile
+        $output = & terraform @allArgs 2>&1
+        $output | Tee-Object -FilePath $logFile
         return $LASTEXITCODE
     } -ArgumentList $VmDir, $stateFile, $varArgs, $logFile
 
@@ -252,7 +253,7 @@ if ($deployedKeys.Count -eq 0) {
 
 Write-SubStep "Successfully deployed: $($deployedKeys -join ', ')"
 
-# --- 3. Poll for completion — download & destroy each VM as it finishes ---
+# --- 3. Poll for completion - download and destroy each VM as it finishes ---
 Write-Step "Polling for benchmark completion (max $MaxWaitMinutes min)..."
 $pending = [System.Collections.Generic.List[string]]::new($deployedKeys)
 $completed = @()
@@ -276,7 +277,7 @@ while ($pending.Count -gt 0 -and $attempt -lt $maxAttempts) {
         $ErrorActionPreference = $prevEAP
 
         if ($exists -eq "true") {
-            Write-SubStep "$key : benchmark complete — downloading results & destroying VM"
+            Write-SubStep "$key : benchmark complete - downloading results, destroying VM"
             $pending.Remove($key) | Out-Null
             $completed += $key
 
@@ -294,7 +295,8 @@ while ($pending.Count -gt 0 -and $attempt -lt $maxAttempts) {
                 param($vmDir, $stateFile, $varArgs, $logFile)
                 Set-Location $vmDir
                 $allArgs = @("destroy", "-auto-approve", "-state", $stateFile, "-input=false") + $varArgs
-                & terraform @allArgs *>&1 | Tee-Object -FilePath $logFile
+                $output = & terraform @allArgs 2>&1
+                $output | Tee-Object -FilePath $logFile
             } -ArgumentList $VmDir, $stateFile, $varArgs, $logFile | Out-Null
         }
     }
@@ -315,7 +317,8 @@ if ($pending.Count -gt 0) {
             param($vmDir, $stateFile, $varArgs)
             Set-Location $vmDir
             $allArgs = @("destroy", "-auto-approve", "-state", $stateFile, "-input=false") + $varArgs
-            & terraform @allArgs *>&1
+            $output = & terraform @allArgs 2>&1
+            $output
         } -ArgumentList $VmDir, $stateFile, $varArgs | Out-Null
     }
 }
