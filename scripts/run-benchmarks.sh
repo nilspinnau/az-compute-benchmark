@@ -341,7 +341,7 @@ for suite in "${SUITE_ARRAY[@]}"; do
     if [[ -f "$script" ]]; then
         echo ""
         echo ">>> Running suite: $suite"
-        bash "$script" "$OUTPUT_DIR"
+        bash "$script" "$OUTPUT_DIR" || echo "WARNING: Suite '$suite' exited with code $? — continuing"
     else
         echo "WARNING: Suite script not found: $script — skipping"
     fi

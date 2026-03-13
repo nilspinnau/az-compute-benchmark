@@ -44,6 +44,7 @@ fio --name=rand-read-4k \
     --output-format=json \
     --output="$RESULTS_DIR/fio-rand-read-4k.json" \
     > /dev/null 2>&1
+rm -f "$TEST_DIR"/*
 
 # 2. Random write 4K
 echo "    [disk] Random write 4K (iodepth=$IODEPTH)..."
@@ -61,6 +62,7 @@ fio --name=rand-write-4k \
     --output-format=json \
     --output="$RESULTS_DIR/fio-rand-write-4k.json" \
     > /dev/null 2>&1
+rm -f "$TEST_DIR"/*
 
 # 3. Sequential read 256K — application binaries, log reading
 echo "    [disk] Sequential read 256K..."
@@ -77,6 +79,7 @@ fio --name=seq-read-256k \
     --output-format=json \
     --output="$RESULTS_DIR/fio-seq-read-256k.json" \
     > /dev/null 2>&1
+rm -f "$TEST_DIR"/*
 
 # 4. Sequential write 256K — log writing, spool
 echo "    [disk] Sequential write 256K..."
@@ -93,6 +96,7 @@ fio --name=seq-write-256k \
     --output-format=json \
     --output="$RESULTS_DIR/fio-seq-write-256k.json" \
     > /dev/null 2>&1
+rm -f "$TEST_DIR"/*
 
 # 5. Mixed random R/W 70/30 — typical SAP app server pattern
 echo "    [disk] Mixed random R/W 70/30 (4K)..."

@@ -143,28 +143,78 @@ foreach ($vmDir in Get-ChildItem -Path $ResultsDir -Directory) {
     $rd = $vmDir.FullName
 
     # ── System info ──
-    $info = [ordered]@{
-        vm_size = "unknown"; cpu_model = $null; cpu_max_mhz = $null
-        cpu_cores = $null; memory_gb = $null; memory_type = $null; memory_speed = $null
-    }
+    $info = [ordered]@{}
     $sysInfoPath = Join-Path $rd "system-info.json"
     if (Test-Path $sysInfoPath) {
         try {
             $si = Get-Content $sysInfoPath -Raw | ConvertFrom-Json
-            $info.vm_size = if ($si.vm_size) { $si.vm_size } else { "unknown" }
+
+            # Helper to return $null for "N/A", "unknown", or empty strings
+            $notNA = { param($v) if ($v -and $v -ne "N/A" -and $v -ne "unknown" -and $v -ne "") { $v } else { $null } }
+
+            # VM / Azure
+            $tmp = & $notNA $si.vm_size; $info.vm_size = if ($tmp) { $tmp } else { "unknown" }
+            $info.vm_location = & $notNA $si.vm_location
+            $info.vm_id       = & $notNA $si.vm_id
+            $info.vm_image    = if ($si.vm_image) { "$($si.vm_image.publisher):$($si.vm_image.offer):$($si.vm_image.sku)" } else { $null }
+
+            # CPU
             if ($si.cpu) {
-                $info.cpu_cores   = $si.cpu.vcpus
-                $info.cpu_model   = $si.cpu.model
-                $info.cpu_max_mhz = $si.cpu.max_mhz
-            } elseif ($si.cpu_cores) {
-                $info.cpu_cores = $si.cpu_cores
+                $c = $si.cpu
+                $info.cpu_model            = $c.model
+                $info.cpu_vendor           = $c.vendor
+                $info.cpu_family           = & $notNA $c.family
+                $info.cpu_stepping         = & $notNA $c.stepping
+                $info.cpu_microcode        = & $notNA $c.microcode
+                $info.cpu_vcpus            = $c.vcpus
+                $info.cpu_sockets          = $c.sockets
+                $info.cpu_cores_per_socket = $c.cores_per_socket
+                $info.cpu_threads_per_core = $c.threads_per_core
+                $tmp = & $notNA $c.max_mhz; $info.cpu_max_mhz = if ($tmp) { $tmp } else { & $notNA $c.dmi_max_speed }
+                $tmp = & $notNA $c.current_mhz; $info.cpu_current_speed = if ($tmp) { $tmp } else { & $notNA $c.dmi_current_speed }
+                $info.cpu_bogomips         = & $notNA $c.bogomips
+                $info.cpu_op_modes         = & $notNA $c.op_modes
+                $info.cpu_address_sizes    = & $notNA $c.address_sizes
+                $info.cpu_hypervisor       = & $notNA $c.hypervisor
+                $info.cpu_cache_l1d        = if ($c.cache) { & $notNA $c.cache.l1d } else { $null }
+                $info.cpu_cache_l1i        = if ($c.cache) { & $notNA $c.cache.l1i } else { $null }
+                $info.cpu_cache_l2         = if ($c.cache) { & $notNA $c.cache.l2 } else { $null }
+                $info.cpu_cache_l3         = if ($c.cache) { & $notNA $c.cache.l3 } else { $null }
             }
+
+            # Memory
             if ($si.memory) {
-                $info.memory_gb    = $si.memory.total_gb
-                $info.memory_type  = $si.memory.type
-                $info.memory_speed = $si.memory.speed
-            } elseif ($si.memory_gb) {
-                $info.memory_gb = $si.memory_gb
+                $m = $si.memory
+                $info.memory_total_gb      = $m.total_gb
+                $info.memory_available_gb  = $m.available_gb
+                $info.memory_swap_gb       = $m.swap_gb
+                $info.memory_type          = & $notNA $m.type
+                $info.memory_speed         = & $notNA $m.speed
+                $info.memory_configured_speed = & $notNA $m.configured_speed
+                $info.memory_max_capacity  = & $notNA $m.max_capacity
+                $info.memory_manufacturer  = & $notNA $m.manufacturer
+                $info.memory_dimm_count    = & $notNA $m.dimm_count
+                $info.memory_per_dimm_size = & $notNA $m.per_dimm_size
+                $info.memory_form_factor   = & $notNA $m.form_factor
+                $info.memory_rank          = & $notNA $m.rank
+                $info.memory_data_width    = & $notNA $m.data_width
+                $info.numa_nodes           = $m.numa_nodes
+                $info.memory_hugepage_size = & $notNA $m.hugepage_size
+                $info.memory_hugepages_total = & $notNA $m.hugepages_total
+            }
+
+            # OS
+            if ($si.os) {
+                $info.os_name        = $si.os.name
+                $info.kernel         = $si.os.kernel
+                $info.kernel_cmdline = & $notNA $si.os.kernel_cmdline
+            }
+
+            # Disk summary from lsblk hardware dump
+            $lsblkPath = Join-Path $rd "hardware\lsblk.txt"
+            if (Test-Path $lsblkPath) {
+                $lsblkLines = Get-Content $lsblkPath | Where-Object { $_ -match "disk" }
+                $info.disks = @($lsblkLines | ForEach-Object { $_.Trim() -replace '\s+', ' ' })
             }
         } catch {}
     }
