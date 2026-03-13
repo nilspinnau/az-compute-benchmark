@@ -218,7 +218,9 @@ foreach ($key in $allVms.Keys) {
         $allArgs = @("apply", "-auto-approve", "-state", $stateFile, "-input=false") + $varArgs
         $output = & terraform @allArgs 2>&1
         $output | Tee-Object -FilePath $logFile
-        return $LASTEXITCODE
+        if ($LASTEXITCODE -ne 0) {
+            throw "terraform apply failed (exit code $LASTEXITCODE)"
+        }
     } -ArgumentList $VmDir, $stateFile, $varArgs, $logFile
 
     $deployJobs[$key] = $job
@@ -229,15 +231,13 @@ Write-Step "Waiting for all deployments to complete..."
 $deployedKeys = @()
 foreach ($key in @($deployJobs.Keys)) {
     $job = $deployJobs[$key]
-    $result = Receive-Job -Job $job -Wait
-    $jobState = $job.State
-
-    if ($jobState -eq "Completed") {
+    try {
+        Receive-Job -Job $job -Wait -ErrorAction Stop
         Write-SubStep "$key : deployed successfully"
         $deployedKeys += $key
     }
-    else {
-        Write-Host "WARNING: $key deployment failed ($jobState)" -ForegroundColor Yellow
+    catch {
+        Write-Host "WARNING: $key deployment failed: $_" -ForegroundColor Yellow
         $logFile = Join-Path $StatesDir "$key-deploy.log"
         if (Test-Path $logFile) {
             Get-Content $logFile -Tail 10 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkYellow }
@@ -251,82 +251,129 @@ if ($deployedKeys.Count -eq 0) {
     exit 1
 }
 
+$failedKeys = @($allVms.Keys | Where-Object { $_ -notin $deployedKeys })
+if ($failedKeys.Count -gt 0) {
+    Write-Host "Failed initial deploy: $($failedKeys -join ', ')" -ForegroundColor Yellow
+    Write-Host "These will be retried after active VMs complete and are destroyed." -ForegroundColor Yellow
+}
+
 Write-SubStep "Successfully deployed: $($deployedKeys -join ', ')"
 
-# --- 3. Poll for completion - download and destroy each VM as it finishes ---
-Write-Step "Polling for benchmark completion (max $MaxWaitMinutes min)..."
-$pending = [System.Collections.Generic.List[string]]::new($deployedKeys)
-$completed = @()
-$maxAttempts = $MaxWaitMinutes * 2  # every 30s
-$attempt = 0
+# --- Helper: Poll a set of VMs for DONE, download results, destroy ---
+function Poll-And-Collect {
+    param(
+        [string[]]$VmKeys,
+        [hashtable]$InfraOutputs,
+        [hashtable]$AllVms,
+        [int]$MaxMinutes
+    )
 
-while ($pending.Count -gt 0 -and $attempt -lt $maxAttempts) {
-    $attempt++
-    Start-Sleep -Seconds 30
+    $pending = New-Object System.Collections.Generic.List[string]
+    foreach ($k in $VmKeys) { $pending.Add($k) }
+    $collected = @()
+    $maxAttempts = $MaxMinutes * 2  # every 30s
+    $attempt = 0
 
-    foreach ($key in @($pending)) {
-        $blobName = "vm-bench-${key}/DONE"
-        $prevEAP = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        $exists = az storage blob exists `
-            --account-name $infraOutputs.storage_account_name `
-            --container-name $infraOutputs.storage_container_name `
-            --name $blobName `
-            --auth-mode login `
-            --query "exists" -o tsv 2>$null
-        $ErrorActionPreference = $prevEAP
+    while ($pending.Count -gt 0 -and $attempt -lt $maxAttempts) {
+        $attempt++
+        Start-Sleep -Seconds 30
 
-        if ($exists -eq "true") {
-            Write-SubStep "$key : benchmark complete - downloading results, destroying VM"
-            $pending.Remove($key) | Out-Null
-            $completed += $key
+        foreach ($key in @($pending)) {
+            $blobName = "vm-bench-${key}/DONE"
+            $prevEAP = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            $exists = az storage blob exists `
+                --account-name $InfraOutputs.storage_account_name `
+                --container-name $InfraOutputs.storage_container_name `
+                --name $blobName `
+                --auth-mode login `
+                --query "exists" -o tsv 2>$null
+            $ErrorActionPreference = $prevEAP
 
-            # Download results immediately
-            Download-Results `
-                -StorageAccount $infraOutputs.storage_account_name `
-                -Container $infraOutputs.storage_container_name `
-                -VmKey $key
+            if ($exists -eq "true") {
+                Write-SubStep "$key : benchmark complete - downloading results, destroying VM"
+                $pending.Remove($key) | Out-Null
+                $collected += $key
 
-            # Destroy VM in background so polling continues
-            $stateFile = Join-Path $StatesDir "$key.tfstate"
-            $logFile = Join-Path $StatesDir "$key-destroy.log"
-            $varArgs = Get-TerraformVarArgs -VmKey $key -VmSize $allVms[$key].vm_size -InfraOutputs $infraOutputs
-            Start-Job -Name "destroy-$key" -ScriptBlock {
-                param($vmDir, $stateFile, $varArgs, $logFile)
-                Set-Location $vmDir
-                $allArgs = @("destroy", "-auto-approve", "-state", $stateFile, "-input=false") + $varArgs
-                $output = & terraform @allArgs 2>&1
-                $output | Tee-Object -FilePath $logFile
-            } -ArgumentList $VmDir, $stateFile, $varArgs, $logFile | Out-Null
+                # Download results immediately
+                Download-Results `
+                    -StorageAccount $InfraOutputs.storage_account_name `
+                    -Container $InfraOutputs.storage_container_name `
+                    -VmKey $key
+
+                # Destroy VM in background so polling continues
+                $stateFile = Join-Path $StatesDir "$key.tfstate"
+                $logFile = Join-Path $StatesDir "$key-destroy.log"
+                $varArgs = Get-TerraformVarArgs -VmKey $key -VmSize $AllVms[$key].vm_size -InfraOutputs $InfraOutputs
+                Start-Job -Name "destroy-$key" -ScriptBlock {
+                    param($vmDir, $stateFile, $varArgs, $logFile)
+                    Set-Location $vmDir
+                    $allArgs = @("destroy", "-auto-approve", "-state", $stateFile, "-input=false") + $varArgs
+                    $output = & terraform @allArgs 2>&1
+                    $output | Tee-Object -FilePath $logFile
+                } -ArgumentList $VmDir, $stateFile, $varArgs, $logFile | Out-Null
+            }
+        }
+
+        if ($pending.Count -gt 0 -and ($attempt % 4 -eq 0)) {
+            $elapsed = [math]::Round($attempt * 30 / 60, 1)
+            Write-SubStep "Waiting (${elapsed}m): $($pending -join ', ')"
         }
     }
 
-    if ($pending.Count -gt 0 -and ($attempt % 4 -eq 0)) {
-        $elapsed = [math]::Round($attempt * 30 / 60, 1)
-        Write-SubStep "Waiting (${elapsed}m): $($pending -join ', ')"
+    # Handle timed-out VMs
+    if ($pending.Count -gt 0) {
+        Write-Host "WARNING: Benchmarks did not complete for: $($pending -join ', ')" -ForegroundColor Yellow
+        foreach ($key in $pending) {
+            Write-SubStep "Destroying timed-out VM: $key"
+            $stateFile = Join-Path $StatesDir "$key.tfstate"
+            $varArgs = Get-TerraformVarArgs -VmKey $key -VmSize $AllVms[$key].vm_size -InfraOutputs $InfraOutputs
+            Start-Job -Name "destroy-$key" -ScriptBlock {
+                param($vmDir, $stateFile, $varArgs)
+                Set-Location $vmDir
+                $allArgs = @("destroy", "-auto-approve", "-state", $stateFile, "-input=false") + $varArgs
+                $output = & terraform @allArgs 2>&1
+                $output
+            } -ArgumentList $VmDir, $stateFile, $varArgs | Out-Null
+        }
     }
+
+    # Wait for all destroy jobs from this round
+    Get-Job | Where-Object { $_.Name -like "destroy-*" -and $_.State -eq "Running" } | Wait-Job -Timeout 300 | Out-Null
+    Get-Job | Where-Object { $_.Name -like "destroy-*" } | Remove-Job -Force
+
+    return $collected
 }
 
-if ($pending.Count -gt 0) {
-    Write-Host "WARNING: Benchmarks did not complete for: $($pending -join ', ')" -ForegroundColor Yellow
-    foreach ($key in $pending) {
-        Write-SubStep "Destroying timed-out VM: $key"
+# --- 3. Poll for completion - download and destroy each VM as it finishes ---
+Write-Step "Polling for benchmark completion (max $MaxWaitMinutes min)..."
+$completed = @(Poll-And-Collect -VmKeys $deployedKeys -InfraOutputs $infraOutputs -AllVms $allVms -MaxMinutes $MaxWaitMinutes)
+
+# --- 3b. Retry failed VMs sequentially (freed quota) ---
+if ($failedKeys.Count -gt 0 -and $completed.Count -gt 0) {
+    Write-Step "Retrying failed VMs sequentially (quota freed)..."
+    foreach ($key in $failedKeys) {
+        $vmSize = $allVms[$key].vm_size
         $stateFile = Join-Path $StatesDir "$key.tfstate"
-        $varArgs = Get-TerraformVarArgs -VmKey $key -VmSize $allVms[$key].vm_size -InfraOutputs $infraOutputs
-        Start-Job -Name "destroy-$key" -ScriptBlock {
-            param($vmDir, $stateFile, $varArgs)
-            Set-Location $vmDir
-            $allArgs = @("destroy", "-auto-approve", "-state", $stateFile, "-input=false") + $varArgs
-            $output = & terraform @allArgs 2>&1
-            $output
-        } -ArgumentList $VmDir, $stateFile, $varArgs | Out-Null
+        $logFile = Join-Path $StatesDir "$key-deploy.log"
+        $varArgs = Get-TerraformVarArgs -VmKey $key -VmSize $vmSize -InfraOutputs $infraOutputs
+
+        Write-SubStep "Deploying $key ($vmSize)..."
+        try {
+            Invoke-Terraform -WorkDir $VmDir `
+                -Arguments (@("apply", "-auto-approve", "-state", $stateFile, "-input=false") + $varArgs) `
+                -Description "$key deploy"
+            Write-SubStep "$key : deployed successfully"
+
+            Write-SubStep "Polling $key for completion..."
+            $retryCompleted = @(Poll-And-Collect -VmKeys @($key) -InfraOutputs $infraOutputs -AllVms $allVms -MaxMinutes $MaxWaitMinutes)
+            $completed += $retryCompleted
+        }
+        catch {
+            Write-Host "WARNING: $key retry failed: $_" -ForegroundColor Yellow
+        }
     }
 }
-
-# Wait for all background destroy jobs
-Write-Step "Waiting for VM destroy jobs to complete..."
-Get-Job | Where-Object { $_.Name -like "destroy-*" -and $_.State -eq "Running" } | Wait-Job -Timeout 300 | Out-Null
-Get-Job | Where-Object { $_.Name -like "destroy-*" } | Remove-Job -Force
 
 # --- 4. Collect & score results ---
 if ($completed.Count -gt 0) {

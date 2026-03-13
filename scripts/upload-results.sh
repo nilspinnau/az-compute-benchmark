@@ -19,16 +19,6 @@ fi
 
 VM_NAME=$(hostname)
 
-# Get an access token via managed identity
-TOKEN=$(curl -s -H "Metadata:true" \
-    "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/" \
-    | jq -r '.access_token')
-
-if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
-    echo "ERROR: Could not obtain managed identity token"
-    exit 1
-fi
-
 BLOB_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}"
 
 # Find the latest result directory
@@ -45,13 +35,49 @@ TAR_FILE="/tmp/benchmark-results-${VM_NAME}.tar.gz"
 tar -czf "$TAR_FILE" -C "$RESULT_DIR" .
 
 BLOB_PATH="${VM_NAME}/results.tar.gz"
-curl -s -X PUT \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "x-ms-blob-type: BlockBlob" \
-    -H "x-ms-version: 2020-10-02" \
-    -H "Content-Type: application/gzip" \
-    --data-binary "@$TAR_FILE" \
-    "${BLOB_URL}/${BLOB_PATH}"
+FILE_SIZE=$(stat -c%s "$TAR_FILE")
+echo "Tar file size: $FILE_SIZE bytes"
 
-echo "Uploaded: ${BLOB_URL}/${BLOB_PATH}"
-rm -f "$TAR_FILE"
+# Retry upload up to 3 times
+for attempt in 1 2 3; do
+    echo "Upload attempt $attempt..."
+
+    # Get fresh token each attempt (tokens can expire)
+    TOKEN=$(curl -s -H "Metadata:true" \
+        "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/" \
+        | jq -r '.access_token')
+
+    if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
+        echo "WARNING: Could not get token on attempt $attempt"
+        sleep 10
+        continue
+    fi
+
+    HTTP_CODE=$(curl -w "%{http_code}" -o /tmp/upload-response.txt \
+        -X PUT \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "x-ms-blob-type: BlockBlob" \
+        -H "x-ms-version: 2020-10-02" \
+        -H "Content-Type: application/gzip" \
+        -H "Content-Length: $FILE_SIZE" \
+        --data-binary "@$TAR_FILE" \
+        "${BLOB_URL}/${BLOB_PATH}" 2>/tmp/upload-curl-stderr.txt)
+
+    echo "HTTP response code: $HTTP_CODE"
+    if [[ "$HTTP_CODE" == "201" ]]; then
+        echo "Uploaded successfully: ${BLOB_URL}/${BLOB_PATH}"
+        rm -f "$TAR_FILE" /tmp/upload-response.txt /tmp/upload-curl-stderr.txt
+        break
+    else
+        echo "Upload failed (HTTP $HTTP_CODE). Response:"
+        cat /tmp/upload-response.txt 2>/dev/null || true
+        cat /tmp/upload-curl-stderr.txt 2>/dev/null || true
+        if [[ $attempt -lt 3 ]]; then
+            echo "Retrying in 15 seconds..."
+            sleep 15
+        else
+            echo "ERROR: Upload failed after 3 attempts"
+            rm -f /tmp/upload-response.txt /tmp/upload-curl-stderr.txt
+        fi
+    fi
+done
