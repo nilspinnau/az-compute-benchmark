@@ -136,6 +136,28 @@ function Get-TerraformVarArgs {
     )
 }
 
+function Open-StorageFirewall {
+    param([string]$StorageAccount, [string]$ResourceGroup)
+    Write-SubStep "Opening storage firewall for $StorageAccount..."
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    az storage account update -n $StorageAccount -g $ResourceGroup `
+        --public-network-access Enabled --default-action Allow 2>&1 | Out-Null
+    $ErrorActionPreference = $prevEAP
+    # Wait for firewall change to propagate
+    Start-Sleep -Seconds 30
+}
+
+function Close-StorageFirewall {
+    param([string]$StorageAccount, [string]$ResourceGroup)
+    Write-SubStep "Closing storage firewall for $StorageAccount..."
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    az storage account update -n $StorageAccount -g $ResourceGroup `
+        --public-network-access Disabled --default-action Deny 2>&1 | Out-Null
+    $ErrorActionPreference = $prevEAP
+}
+
 function Download-Results {
     param(
         [string]$StorageAccount,
@@ -345,7 +367,12 @@ function Poll-And-Collect {
     return $collected
 }
 
-# --- 3. Poll for completion - download and destroy each VM as it finishes ---
+# --- 3. Open firewall, poll for completion, download and destroy each VM ---
+Write-Step "Opening storage firewall for local access..."
+Open-StorageFirewall -StorageAccount $infraOutputs.storage_account_name -ResourceGroup $infraOutputs.resource_group_name
+
+try {
+
 Write-Step "Polling for benchmark completion (max $MaxWaitMinutes min)..."
 $completed = @(Poll-And-Collect -VmKeys $deployedKeys -InfraOutputs $infraOutputs -AllVms $allVms -MaxMinutes $MaxWaitMinutes)
 
@@ -373,6 +400,12 @@ if ($failedKeys.Count -gt 0 -and $completed.Count -gt 0) {
             Write-Host "WARNING: $key retry failed: $_" -ForegroundColor Yellow
         }
     }
+}
+
+} # end try
+finally {
+    Write-Step "Closing storage firewall..."
+    Close-StorageFirewall -StorageAccount $infraOutputs.storage_account_name -ResourceGroup $infraOutputs.resource_group_name
 }
 
 # --- 4. Collect & score results ---
