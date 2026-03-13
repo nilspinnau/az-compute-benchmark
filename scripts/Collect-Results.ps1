@@ -102,7 +102,7 @@ function Get-SysbenchNumber {
     $line = Select-String -Path $FilePath -Pattern $Pattern | Select-Object -First 1
     if ($line) {
         $parts = $line.Line.Trim() -split '\s+'
-        $val = $parts[-1]
+        $val = $parts[-1] -replace '[^\d.\-]',''  # strip unit suffixes like 's'
         try { return [double]$val } catch { return $null }
     }
     return $null
@@ -140,11 +140,7 @@ $vms = [ordered]@{}
 
 foreach ($vmDir in Get-ChildItem -Path $ResultsDir -Directory) {
     $vmName = $vmDir.Name
-
-    # Find result subdirectory (hostname-timestamp pattern)
-    $resultDir = Get-ChildItem -Path $vmDir.FullName -Directory | Select-Object -Last 1
-    if (-not $resultDir) { $resultDir = $vmDir }
-    $rd = $resultDir.FullName
+    $rd = $vmDir.FullName
 
     # ── System info ──
     $info = [ordered]@{
@@ -189,7 +185,16 @@ foreach ($vmDir in Get-ChildItem -Path $ResultsDir -Directory) {
             $metrics.cpu_multi_eps = Get-SysbenchNumber ($multiFiles | Select-Object -Last 1).FullName "events per second"
         }
     }
-    $metrics.ctx_switch_eps    = Get-SysbenchNumber (Join-Path $rd "cpu\sysbench-threads.txt") "events per second"
+    # threads benchmark doesn't have "events per second" - compute from total events / total time
+    $threadsFile = Join-Path $rd "cpu\sysbench-threads.txt"
+    $metrics.ctx_switch_eps = $null
+    if (Test-Path $threadsFile) {
+        $totalEvents = Get-SysbenchNumber $threadsFile "total number of events"
+        $totalTime   = Get-SysbenchNumber $threadsFile "total time:"
+        if ($null -ne $totalEvents -and $null -ne $totalTime -and $totalTime -gt 0) {
+            $metrics.ctx_switch_eps = [math]::Round($totalEvents / $totalTime, 2)
+        }
+    }
     # Mutex: extract total time
     $mutexFile = Join-Path $rd "cpu\sysbench-mutex.txt"
     $metrics.mutex_total_time_s = Get-SysbenchNumber $mutexFile "total time:"
