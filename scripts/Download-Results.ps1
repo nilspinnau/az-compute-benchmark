@@ -55,9 +55,9 @@ $ScriptsDir = $PSScriptRoot
 
 # --- VM configurations (must match Deploy-Benchmark.ps1) ---
 $allVmConfigs = [ordered]@{
-    "e64asv5" = @{ vm_size = "Standard_E64as_v5" }
-    "e64sv5"  = @{ vm_size = "Standard_E64s_v5" }
-    "e64asv6" = @{ vm_size = "Standard_E64as_v6" }
+    "e8asv5" = @{ vm_size = "Standard_E8as_v5" }
+    "e8sv5"  = @{ vm_size = "Standard_E8s_v5" }
+    "e8asv6" = @{ vm_size = "Standard_E8as_v6" }
 }
 
 # --- Helpers ---
