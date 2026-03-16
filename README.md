@@ -216,13 +216,12 @@ cp benchmark.example.json benchmark.json
 | `vms` | Map of VM key → `{ "vm_size": "Standard_..." }` | Yes |
 | `resource_group_name` | Resource group name | No (default: `rg-sap-benchmark`) |
 | `address_space` | VNet CIDR | No (default: `10.0.0.0/24`) |
-| `os_image` | OS image (publisher/offer/sku/version) | No (default: SLES SAP 15 SP5) |
-| `os_disk_size_gb` | OS disk size | No (default: 64) |
 | `benchmark_suites` | Comma-separated suites to run | No (default: all) |
-| `github_repo_url` | Repo URL for benchmark scripts | No |
-| `github_ref` | Branch/tag/commit | No (default: `main`) |
+| `github_ref` | Branch/tag/commit for scripts | No (default: `main`) |
 | `max_wait_minutes` | Polling timeout | No (default: 120) |
-| `tags` | Azure resource tags | No |
+
+> OS image, disk type/size, and other Terraform-level settings are configured via
+> Terraform variable defaults in `vm/variables.tf` and `infra/variables.tf`.
 
 Example `benchmark.json`:
 
