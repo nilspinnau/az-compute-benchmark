@@ -1,0 +1,28 @@
+{
+  "subscription_id": "your-azure-subscription-id",
+  "location": "swedencentral",
+  "ssh_public_key_path": "~/.ssh/id_rsa.pub",
+  "resource_group_name": "rg-sap-benchmark",
+  "address_space": "10.0.0.0/24",
+  "os_image": {
+    "publisher": "SUSE",
+    "offer": "sles-sap-15-sp5",
+    "sku": "gen2",
+    "version": "latest"
+  },
+  "os_disk_size_gb": 64,
+  "os_disk_type": "Premium_LRS",
+  "benchmark_suites": "cpu,memory,disk,network,system",
+  "github_repo_url": "https://github.com/nilspinnau/az-compute-benchmark",
+  "github_ref": "main",
+  "max_wait_minutes": 120,
+  "tags": {
+    "environment": "benchmark",
+    "project": "sap-vm-benchmark"
+  },
+  "vms": {
+    "e8asv5": { "vm_size": "Standard_E8as_v5" },
+    "e8sv5":  { "vm_size": "Standard_E8s_v5" },
+    "e8asv6": { "vm_size": "Standard_E8as_v6" }
+  }
+}

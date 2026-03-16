@@ -7,12 +7,14 @@
     downloads results for completed VMs, optionally destroys VMs, closes
     the firewall, and runs scoring.
 
-    Can target specific VMs or all VMs with results in blob storage.
-    Works independently of Deploy-Benchmark.ps1 - you can run this at any time.
+    VM definitions, Azure settings, and defaults are read from a JSON config
+    file (default: benchmark.json in the project root).
+
+.PARAMETER ConfigFile
+    Path to JSON config file. Default: <project-root>/benchmark.json
 
 .PARAMETER VmNames
-    Comma-separated VM keys to check (e.g. "e64asv5,e64sv5,e64asv6").
-    Default: auto-detect from blob storage DONE markers.
+    Comma-separated VM keys to check. Default: auto-detect from blob storage.
 
 .PARAMETER DestroyVms
     If set, destroy VMs after downloading their results.
@@ -21,28 +23,29 @@
     If set, destroy shared infrastructure after all VMs are done.
 
 .PARAMETER MaxWaitMinutes
-    Maximum minutes to wait for benchmarks. Default: 120. Set to 0 for no waiting
-    (only download already-completed results).
+    Maximum minutes to wait for benchmarks. Default: from config file.
+    Set to 0 for no waiting (only download already-completed results).
 
 .PARAMETER Suites
-    Only needed if -DestroyVms is set (for terraform var args). Default: cpu,memory,disk,network,system
+    Only needed if -DestroyVms is set. Default: from config file.
 
 .PARAMETER GithubRef
-    Only needed if -DestroyVms is set (for terraform var args). Default: main
+    Only needed if -DestroyVms is set. Default: from config file.
 
 .EXAMPLE
     .\Download-Results.ps1
-    .\Download-Results.ps1 -VmNames "e64asv5,e64sv5,e64asv6" -DestroyVms
+    .\Download-Results.ps1 -DestroyVms
     .\Download-Results.ps1 -MaxWaitMinutes 0
-    .\Download-Results.ps1 -VmNames "e64asv5" -MaxWaitMinutes 60 -DestroyVms
+    .\Download-Results.ps1 -ConfigFile "./my-config.json" -DestroyVms -DestroyInfra
 #>
 param(
+    [string]$ConfigFile = "",
     [string]$VmNames = "",
-    [int]$MaxWaitMinutes = 120,
+    [int]$MaxWaitMinutes = -1,
     [switch]$DestroyVms,
     [switch]$DestroyInfra,
-    [string]$Suites = "cpu,memory,disk,network,system",
-    [string]$GithubRef = "main"
+    [string]$Suites = "",
+    [string]$GithubRef = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,11 +56,22 @@ $StatesDir = Join-Path $ProjectDir "states"
 $ResultsDir = Join-Path $ProjectDir "results"
 $ScriptsDir = $PSScriptRoot
 
-# --- VM configurations (must match Deploy-Benchmark.ps1) ---
-$allVmConfigs = [ordered]@{
-    "e8asv5" = @{ vm_size = "Standard_E8as_v5" }
-    "e8sv5"  = @{ vm_size = "Standard_E8s_v5" }
-    "e8asv6" = @{ vm_size = "Standard_E8as_v6" }
+# --- Load config ---
+if ($ConfigFile -eq "") { $ConfigFile = Join-Path $ProjectDir "benchmark.json" }
+if (-not (Test-Path $ConfigFile)) {
+    Write-Host "ERROR: Config file not found: $ConfigFile" -ForegroundColor Red
+    Write-Host "Copy benchmark.example.json to benchmark.json and edit it." -ForegroundColor Yellow
+    exit 1
+}
+$config = Get-Content $ConfigFile -Raw | ConvertFrom-Json
+if ($Suites -eq "")         { $Suites = $config.benchmark_suites }
+if ($GithubRef -eq "")      { $GithubRef = $config.github_ref }
+if ($MaxWaitMinutes -eq -1) { $MaxWaitMinutes = $config.max_wait_minutes }
+
+# Build VM config from config file
+$allVmConfigs = [ordered]@{}
+foreach ($prop in $config.vms.PSObject.Properties) {
+    $allVmConfigs[$prop.Name] = @{ vm_size = $prop.Value.vm_size }
 }
 
 # --- Helpers ---
@@ -170,14 +184,14 @@ function Download-VmResults {
 
 # Get infra outputs
 $infraOutputs = @{
-    subscription_id        = (Get-Content (Join-Path $InfraDir "terraform.tfvars") | Select-String 'subscription_id\s*=' | ForEach-Object { ($_ -split '"')[1] })
+    subscription_id        = $config.subscription_id
     resource_group_name    = Get-InfraOutput "resource_group_name"
     location               = Get-InfraOutput "location"
     subnet_id              = Get-InfraOutput "subnet_id"
     storage_account_id     = Get-InfraOutput "storage_account_id"
     storage_account_name   = Get-InfraOutput "storage_account_name"
     storage_container_name = Get-InfraOutput "storage_container_name"
-    ssh_public_key_path    = "~/.ssh/id_aldi_ed25519.pub"
+    ssh_public_key_path    = $config.ssh_public_key_path
 }
 
 $storageAccount = $infraOutputs.storage_account_name

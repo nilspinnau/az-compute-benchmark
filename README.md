@@ -34,33 +34,38 @@ Raw dumps from `lscpu`, `/proc/cpuinfo`, `/proc/meminfo`, `dmidecode` are also s
 - SSH key pair (for VM provisioning — no SSH access is used at runtime)
 - PowerShell 5.1+ (Windows) or pwsh (Linux/macOS)
 
+### Setup
+
+```powershell
+# 1. Create your config file from the example
+cp benchmark.example.json benchmark.json
+
+# 2. Edit benchmark.json — set at minimum:
+#    - subscription_id: your Azure subscription
+#    - ssh_public_key_path: path to your SSH public key
+#    - vms: the VM SKUs you want to benchmark
+```
+
 ### One-Command Run
 
 ```powershell
-# 1. Configure shared infrastructure
-cp infra/terraform.tfvars.example infra/terraform.tfvars
-# Edit infra/terraform.tfvars — set your subscription_id
-
-# 2. Run everything
 .\scripts\Run-Benchmark-All.ps1
 ```
 
 The orchestration script handles the full lifecycle:
 1. **Deploy shared infrastructure** — resource group, VNet, subnet, NAT gateway, NSG, storage account
-2. **For each batch of VMs** (default: 2 at a time):
-   - Deploy VM via Terraform (NIC, VM, managed identity, role assignment)
-   - cloud-init installs tools, builds sysbench, downloads scripts from GitHub, and runs benchmarks autonomously
-   - Poll Azure Blob Storage for a `DONE` marker blob (uploaded by the VM when benchmarks finish)
-   - Download results from blob storage locally
-   - Destroy the batch VMs
-3. **Score and compare** — parse results into a scored JSON + CSV summary (relative-to-best scoring, weighted composite)
-4. **Destroy infrastructure** (unless `-SkipDestroy` is set)
+2. **Deploy all VMs in parallel** via Terraform (NIC, VM, managed identity, role assignment)
+3. cloud-init installs tools, builds sysbench, downloads scripts from GitHub, and runs benchmarks autonomously
+4. **Poll** Azure Blob Storage for `DONE` marker blobs (uploaded by each VM when benchmarks finish)
+5. **Download results** from blob storage locally
+6. **Destroy VMs and infrastructure** (unless `-SkipDestroy` is set)
+7. **Score and compare** — parse results into a scored JSON + CSV summary
 
 ### Options
 
 ```powershell
-# Custom batch size (deploy 1 VM at a time)
-.\scripts\Run-Benchmark-All.ps1 -BatchSize 1
+# Deploy specific VMs only (keys must exist in benchmark.json)
+.\scripts\Run-Benchmark-All.ps1 -VmNames "e8asv5,e8sv5"
 
 # Only run specific suites
 .\scripts\Run-Benchmark-All.ps1 -Suites "cpu,memory"
@@ -70,40 +75,22 @@ The orchestration script handles the full lifecycle:
 
 # Use a different git branch for benchmark scripts
 .\scripts\Run-Benchmark-All.ps1 -GithubRef "dev"
+
+# Use a custom config file
+.\scripts\Run-Benchmark-All.ps1 -ConfigFile "./my-benchmark.json"
 ```
 
 ### Manual / Step-by-Step
 
 ```powershell
-# 1. Deploy shared infrastructure
-cd infra
-terraform init
-terraform apply
-cd ..
+# 1. Deploy infrastructure and VMs
+.\scripts\Deploy-Benchmark.ps1
 
-# 2. Deploy a single VM (uses a separate state file)
-cd vm
-terraform init
-terraform apply \
-  -state="../states/e64asv5.tfstate" \
-  -var="vm_name=e64asv5" \
-  -var="vm_size=Standard_E64as_v5" \
-  -var="resource_group_name=rg-sap-benchmark" \
-  -var="subnet_id=<subnet-id-from-infra-output>" \
-  -var="storage_account_id=<storage-id>" \
-  -var="storage_account_name=<storage-name>" \
-  -var="storage_container_name=benchmark-results"
+# 2. Download results when ready, then destroy
+.\scripts\Download-Results.ps1 -DestroyVms -DestroyInfra
 
-# 3. Wait for the DONE marker in blob storage, then download results
-# 4. Destroy VM
-terraform destroy -state="../states/e64asv5.tfstate"
-cd ..
-
-# 5. Collect and score results
+# 3. Re-score existing local results
 .\scripts\Collect-Results.ps1
-
-# 6. Destroy shared infrastructure
-cd infra && terraform destroy
 ```
 
 ## Architecture
@@ -162,6 +149,7 @@ Output: `results/summary.json` and `results/summary.csv`
 
 ```
 .
+├── benchmark.example.json           # Example config file (copy to benchmark.json)
 ├── infra/                           # Shared infrastructure (deploy once)
 │   ├── providers.tf
 │   ├── variables.tf
@@ -178,6 +166,8 @@ Output: `results/summary.json` and `results/summary.csv`
 │   ├── vm-entrypoint.sh             # Standalone entrypoint (alternative to cloud-init)
 │   ├── run-benchmarks.sh            # Main benchmark runner with hardware metadata
 │   ├── upload-results.sh            # Upload results to blob via managed identity
+│   ├── Deploy-Benchmark.ps1         # Deploy infra + VMs (PowerShell)
+│   ├── Download-Results.ps1         # Poll, download, destroy (PowerShell)
 │   ├── Run-Benchmark-All.ps1        # Full orchestration (PowerShell)
 │   ├── Collect-Results.ps1          # Parse + score results (PowerShell)
 │   ├── collect-results.sh           # Parse + score results (Bash)
@@ -210,15 +200,46 @@ echo "    [custom] Done. Results in $RESULTS_DIR"
 
 Then include it: `-Suites "cpu,memory,custom"`
 
-## Default VM Configurations
+## Configuration
 
-| Name | VM Size | vCPUs | Memory | Processor |
-|------|---------|-------|--------|-----------|
-| e64asv5 | Standard_E64as_v5 | 64 | 512 GiB | AMD EPYC 7763 |
-| e64sv5 | Standard_E64s_v5 | 64 | 512 GiB | Intel Xeon Platinum 8370C |
-| e96asv5 | Standard_E96as_v5 | 96 | 672 GiB | AMD EPYC 7763 |
+All user settings live in `benchmark.json` (gitignored). Copy the example to get started:
 
-To benchmark different VM sizes, edit the `$allVms` hashtable in `scripts/Run-Benchmark-All.ps1`.
+```bash
+cp benchmark.example.json benchmark.json
+```
+
+| Field | Description | Required |
+|-------|-------------|----------|
+| `subscription_id` | Azure subscription ID | Yes |
+| `location` | Azure region | Yes |
+| `ssh_public_key_path` | Path to SSH public key | Yes |
+| `vms` | Map of VM key → `{ "vm_size": "Standard_..." }` | Yes |
+| `resource_group_name` | Resource group name | No (default: `rg-sap-benchmark`) |
+| `address_space` | VNet CIDR | No (default: `10.0.0.0/24`) |
+| `os_image` | OS image (publisher/offer/sku/version) | No (default: SLES SAP 15 SP5) |
+| `os_disk_size_gb` | OS disk size | No (default: 64) |
+| `benchmark_suites` | Comma-separated suites to run | No (default: all) |
+| `github_repo_url` | Repo URL for benchmark scripts | No |
+| `github_ref` | Branch/tag/commit | No (default: `main`) |
+| `max_wait_minutes` | Polling timeout | No (default: 120) |
+| `tags` | Azure resource tags | No |
+
+Example `benchmark.json`:
+
+```json
+{
+  "subscription_id": "00000000-0000-0000-0000-000000000000",
+  "location": "swedencentral",
+  "ssh_public_key_path": "~/.ssh/id_rsa.pub",
+  "vms": {
+    "e8asv5": { "vm_size": "Standard_E8as_v5" },
+    "e8sv5":  { "vm_size": "Standard_E8s_v5" },
+    "d32sv5": { "vm_size": "Standard_D32s_v5" }
+  }
+}
+```
+
+To benchmark different VM sizes, just edit the `vms` section — no code changes needed.
 
 ## Requirements
 

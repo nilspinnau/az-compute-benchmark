@@ -7,29 +7,37 @@
     Each VM runs benchmarks via cloud-init and uploads results to blob storage.
     Use Download-Results.ps1 separately to collect results.
 
+    VM definitions, Azure settings, and SSH key path are read from a JSON config
+    file (default: benchmark.json in the project root). Copy benchmark.example.json
+    to benchmark.json and edit it before first use.
+
+.PARAMETER ConfigFile
+    Path to JSON config file. Default: <project-root>/benchmark.json
+
 .PARAMETER VmNames
-    Comma-separated VM keys to deploy (e.g. "e64asv5,e64sv5,e64asv6").
-    Default: all VMs defined in the configuration.
+    Comma-separated VM keys to deploy. Keys must exist in config file.
+    Default: all VMs defined in config.
 
 .PARAMETER Suites
-    Comma-separated benchmark suites. Default: cpu,memory,disk,network,system
+    Comma-separated benchmark suites. Default: from config file.
 
 .PARAMETER GithubRef
-    Git branch/tag/commit for benchmark scripts. Default: main
+    Git branch/tag/commit for benchmark scripts. Default: from config file.
 
 .PARAMETER SkipInfra
     If set, skip infra deployment (assume already deployed).
 
 .EXAMPLE
     .\Deploy-Benchmark.ps1
-    .\Deploy-Benchmark.ps1 -VmNames "e64asv5"
-    .\Deploy-Benchmark.ps1 -VmNames "e64asv5,e64sv5" -Suites "cpu,memory"
-    .\Deploy-Benchmark.ps1 -VmNames "e64asv5" -SkipInfra
+    .\Deploy-Benchmark.ps1 -VmNames "e8asv5"
+    .\Deploy-Benchmark.ps1 -VmNames "e8asv5,e8sv5" -Suites "cpu,memory"
+    .\Deploy-Benchmark.ps1 -ConfigFile "./my-config.json"
 #>
 param(
+    [string]$ConfigFile = "",
     [string]$VmNames = "",
-    [string]$Suites = "cpu,memory,disk,network,system",
-    [string]$GithubRef = "main",
+    [string]$Suites = "",
+    [string]$GithubRef = "",
     [switch]$SkipInfra
 )
 
@@ -39,11 +47,21 @@ $InfraDir = Join-Path $ProjectDir "infra"
 $VmDir = Join-Path $ProjectDir "vm"
 $StatesDir = Join-Path $ProjectDir "states"
 
-# --- VM configurations ---
-$allVmConfigs = [ordered]@{
-    "e8asv5" = @{ vm_size = "Standard_E8as_v5" }
-    "e8sv5"  = @{ vm_size = "Standard_E8s_v5" }
-    "e8asv6" = @{ vm_size = "Standard_E8as_v6" }
+# --- Load config ---
+if ($ConfigFile -eq "") { $ConfigFile = Join-Path $ProjectDir "benchmark.json" }
+if (-not (Test-Path $ConfigFile)) {
+    Write-Host "ERROR: Config file not found: $ConfigFile" -ForegroundColor Red
+    Write-Host "Copy benchmark.example.json to benchmark.json and edit it." -ForegroundColor Yellow
+    exit 1
+}
+$config = Get-Content $ConfigFile -Raw | ConvertFrom-Json
+if ($Suites -eq "")    { $Suites = $config.benchmark_suites }
+if ($GithubRef -eq "") { $GithubRef = $config.github_ref }
+
+# Build VM config from config file
+$allVmConfigs = [ordered]@{}
+foreach ($prop in $config.vms.PSObject.Properties) {
+    $allVmConfigs[$prop.Name] = @{ vm_size = $prop.Value.vm_size }
 }
 
 # Determine which VMs to deploy
@@ -125,6 +143,14 @@ New-Item -ItemType Directory -Path $StatesDir -Force | Out-Null
 # --- 1. Deploy shared infrastructure ---
 if (-not $SkipInfra) {
     Write-Step "Deploying shared infrastructure..."
+    # Generate terraform.tfvars from config
+    $tfvarsContent = @"
+subscription_id     = "$($config.subscription_id)"
+location            = "$($config.location)"
+resource_group_name = "$($config.resource_group_name)"
+address_space       = "$($config.address_space)"
+"@
+    $tfvarsContent | Out-File -FilePath (Join-Path $InfraDir "terraform.tfvars") -Encoding UTF8
     Invoke-Terraform -WorkDir $InfraDir -Arguments @("init", "-input=false") -Description "infra init"
     Invoke-Terraform -WorkDir $InfraDir -Arguments @("apply", "-auto-approve") -Description "infra apply"
 } else {
@@ -132,14 +158,14 @@ if (-not $SkipInfra) {
 }
 
 $infraOutputs = @{
-    subscription_id        = (Get-Content (Join-Path $InfraDir "terraform.tfvars") | Select-String 'subscription_id\s*=' | ForEach-Object { ($_ -split '"')[1] })
+    subscription_id        = $config.subscription_id
     resource_group_name    = Get-InfraOutput "resource_group_name"
     location               = Get-InfraOutput "location"
     subnet_id              = Get-InfraOutput "subnet_id"
     storage_account_id     = Get-InfraOutput "storage_account_id"
     storage_account_name   = Get-InfraOutput "storage_account_name"
     storage_container_name = Get-InfraOutput "storage_container_name"
-    ssh_public_key_path    = "~/.ssh/id_aldi_ed25519.pub"
+    ssh_public_key_path    = $config.ssh_public_key_path
 }
 
 Write-SubStep "Resource group: $($infraOutputs.resource_group_name)"

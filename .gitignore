@@ -7,6 +7,9 @@
 terraform.tfvars
 .terraform.tfstate.lock.info
 
+# User config (contains subscription IDs etc)
+benchmark.json
+
 # Per-VM state files
 states/
 
