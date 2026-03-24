@@ -1,0 +1,13 @@
+{
+  "location": "swedencentral",
+  "benchmarkSuites": "cpu,memory,disk,network,system",
+  "githubRef": "main",
+  "githubRepoUrl": "https://github.com/nilspinnau/az-compute-benchmark",
+  "addressSpace": "10.0.0.0/24",
+  "maxWaitMinutes": 120,
+  "vms": {
+    "e8asv5": { "vmSize": "Standard_E8as_v5" },
+    "e8sv5":  { "vmSize": "Standard_E8s_v5" },
+    "e8asv6": { "vmSize": "Standard_E8as_v6" }
+  }
+}

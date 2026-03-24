@@ -4,20 +4,27 @@
 *.tfstate
 *.tfstate.backup
 *.tfplan
+tfplan
 terraform.tfvars
 .terraform.tfstate.lock.info
 
-# User config (contains subscription IDs etc)
-benchmark.json
-
-# Per-VM state files
-states/
-
-# Benchmark results
-results/
+# Function App
+function-app/Modules/
+function-app/local.settings.json
+function-app.zip
 
 # Logs
 benchmark-run.log
+*.log
+
+# Local results
+results/
+
+# Temporary/debug scripts
+do_cleanup.ps1
+terminate-and-start.ps1
+upload-fix.sh
+cleanup_result.txt
 
 # OS
 .DS_Store

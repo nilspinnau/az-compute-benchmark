@@ -43,9 +43,12 @@ for attempt in 1 2 3; do
     echo "Upload attempt $attempt..."
 
     # Get fresh token each attempt (tokens can expire)
-    TOKEN=$(curl -s -H "Metadata:true" \
-        "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/" \
-        | jq -r '.access_token')
+    # Use MI_CLIENT_ID if set (user-assigned managed identity)
+    IMDS_URL="http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/"
+    if [[ -n "${MI_CLIENT_ID:-}" ]]; then
+        IMDS_URL="${IMDS_URL}&client_id=${MI_CLIENT_ID}"
+    fi
+    TOKEN=$(curl -s -H "Metadata:true" "$IMDS_URL" | jq -r '.access_token')
 
     if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
         echo "WARNING: Could not get token on attempt $attempt"
